@@ -570,7 +570,10 @@ def list_emails(folder: str = "Inbox", limit: int = 25, offset: int = 0, unread_
 _CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯豈-﫿]")
 EXACT_SCAN_DEFAULT = 1500
 EXACT_SCAN_MAX = 10000
-EXACT_TIME_BUDGET_SECONDS = 90
+# Remote clients (claude.ai talking to this PC through Claude Desktop) give up after 60 s, so every
+# search returns within this budget, with what it found so far and a point to resume from.
+CALL_TIME_BUDGET_SECONDS = float(os.environ.get("OUTLOOK_MCP_TIME_BUDGET", "40"))
+_INDEX_FALLBACK_RESERVE_SECONDS = 6
 
 
 def _search_folders(ns, folder: str, include_subfolders: bool) -> list:
@@ -582,9 +585,12 @@ def _search_folders(ns, folder: str, include_subfolders: bool) -> list:
     return list(_iter_mail_folders(_resolve_folder(ns, folder), include_subfolders))
 
 
-def _gather(folders, dasl: str | None, per_folder: int, errors: list[str]) -> list[_Row]:
+def _gather(folders, dasl: str | None, per_folder: int, errors: list[str], deadline: float) -> list[_Row]:
     rows: list[_Row] = []
-    for f in folders:
+    for i, f in enumerate(folders):
+        if time.monotonic() > deadline:
+            errors.append(f"time budget reached; {len(folders) - i} folder(s) not searched")
+            break
         try:
             rows.extend(_table_rows(f, dasl, per_folder))
         except Exception as exc:  # noqa: BLE001
@@ -593,16 +599,16 @@ def _gather(folders, dasl: str | None, per_folder: int, errors: list[str]) -> li
     return rows
 
 
-def _exact_scan(ns, candidates: list[_Row], needle: str, search_body: bool, limit: int) -> tuple[list[_Row], int, bool]:
-    """Stage 2: check the text itself, newest first, stopping at `limit` hits or the time budget.
+def _exact_scan(ns, candidates: list[_Row], needle: str, search_body: bool, limit: int,
+                deadline: float) -> tuple[list[_Row], int, bool]:
+    """Stage 2: check the text itself, newest first, stopping at `limit` hits or the deadline.
 
     The subject comes with the row; only rows whose subject doesn't match need the body,
-    which costs one Outlook round trip each (~40 ms).
+    which costs one Outlook round trip each (~30 ms).
     """
     needle = needle.lower()
     hits: list[_Row] = []
     scanned = 0
-    deadline = time.monotonic() + EXACT_TIME_BUDGET_SECONDS
     for row in candidates:
         if len(hits) >= limit:
             break
@@ -641,6 +647,7 @@ def search_emails(
 ) -> dict[str, Any]:
     if match_mode not in ("auto", "index", "exact"):
         raise OutlookError("match_mode must be 'auto', 'index' or 'exact'.")
+    deadline = time.monotonic() + CALL_TIME_BUDGET_SECONDS
     limit = max(1, min(limit, MAX_ITEMS_HARD_CAP))
     ns = _ns()
     folders = _search_folders(ns, folder, include_subfolders)
@@ -652,10 +659,12 @@ def search_emails(
     )
     result: dict[str, Any] = {"folders_searched": len(folders), "match": "exact" if exact else "index"}
 
-    if not exact:
-        dasl = _build_filter(query, search_body, subject, sender, recipient,
+    def index_filter():
+        return _build_filter(query, search_body, subject, sender, recipient,
                              received_after, received_before, unread_only, has_attachments)
-        rows = _gather(folders, dasl, limit, errors)
+
+    if not exact:
+        rows = _gather(folders, index_filter(), limit, errors, deadline)
         hits = rows[:limit]
         if len(rows) > limit:
             result["note"] = "More matches exist; narrow the search or raise limit."
@@ -664,27 +673,29 @@ def search_emails(
         max_scan = max(1, min(max_scan, EXACT_SCAN_MAX))
         dasl = _build_filter(None, search_body, subject, sender, recipient,
                              received_after, received_before, unread_only, has_attachments)
-        candidates = _gather(folders, dasl, max_scan, errors)
-        candidates = candidates[:max_scan]
-        # Stage 2: exact substring check in subject/body.
-        hits, scanned, timed_out = _exact_scan(ns, candidates, query, search_body, limit)
+        candidates = _gather(folders, dasl, max_scan, errors, deadline)[:max_scan]
+        # Stage 2: exact substring check, leaving time for the index fallback below.
+        hits, scanned, timed_out = _exact_scan(
+            ns, candidates, query, search_body, limit, deadline - _INDEX_FALLBACK_RESERVE_SECONDS)
         result["scanned"] = scanned
         covered_all = scanned == len(candidates) and len(candidates) < max_scan
         if len(hits) >= limit:
             result["note"] = "Limit reached; older matches may exist."
         elif not covered_all and candidates:
-            oldest = _fmt_time(candidates[min(scanned, len(candidates)) - 1].received) if scanned else None
-            reason = "time budget" if timed_out else f"max_scan={max_scan}"
+            # Resume point: one minute after the oldest email checked, so nothing in that minute is skipped.
+            oldest = candidates[max(scanned, 1) - 1].received + _dt.timedelta(minutes=1)
+            result["checked_until"] = oldest.strftime("%Y-%m-%d %H:%M")
+            reason = "the time limit" if timed_out else f"max_scan={max_scan}"
             result["note"] = (
-                f"Exact check stopped at {reason}; emails older than {oldest} were not checked. "
-                "Narrow with received_after/received_before, sender or folder, or raise max_scan. "
-                "Indexed matches from older emails are added below."
+                f"Exact check stopped at {reason}: emails received before {result['checked_until']} were "
+                "not checked word for word. To continue, call again with the same criteria and "
+                "received_before=checked_until (adding received_after or a sender makes it faster). "
+                "Search-index matches from those older emails are included below."
             )
             # Fall back to the index for the part the exact scan did not reach.
             seen = {r.entry_id for r in hits}
-            idx = _build_filter(query, search_body, subject, sender, recipient,
-                                received_after, received_before, unread_only, has_attachments)
-            extra = [r for r in _gather(folders, idx, limit, errors) if r.entry_id not in seen]
+            extra = [r for r in _gather(folders, index_filter(), limit, errors, deadline)
+                     if r.entry_id not in seen]
             hits = sorted(hits + extra, key=lambda r: r.received, reverse=True)[:limit]
 
     result["returned"] = len(hits)

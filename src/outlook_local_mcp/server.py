@@ -39,8 +39,10 @@ FINDING MAIL
 - list_emails: newest first, metadata only; page with offset.
 - search_emails: combine criteria (sender, recipient, subject, received_after/before as YYYY-MM-DD,
   has_attachments, folder='all' for the whole mailbox). Chinese queries use exact matching, which reads
-  bodies (~40 ms each): ALWAYS add a date range, sender or specific folder when you can. If the result
-  has a 'note' saying the scan stopped, narrow the search rather than raising limits blindly.
+  bodies (~30 ms each): ALWAYS add a date range, sender or specific folder when you can. Every search
+  returns within ~40 s. If the result has 'checked_until', older emails were not checked word for word:
+  if you still need them, call again with the same criteria and received_before=checked_until. Do not
+  repeat a search that timed out or failed without changing it; tell the user instead.
 - get_email for the body (does not mark as read); get_thread for the whole conversation.
 
 ATTACHMENTS
@@ -115,10 +117,12 @@ def search_emails(
 
     query: text to find in the subject or (if search_body) the body.
     match_mode: 'index' uses the Windows Search index (sub-second, but misses many Chinese words);
-      'exact' filters by the other criteria first, then checks the text itself newest-first (~40 ms
+      'exact' filters by the other criteria first, then checks the text itself newest-first (~30 ms
       per email whose subject doesn't match, stops at `limit` hits; up to max_scan emails, max 10000);
       'auto' (default) picks exact for Chinese/Japanese/Korean queries and index otherwise.
       If an English search misses something, retry with match_mode='exact' plus a date range.
+    Each call returns within ~40 s. If the result includes 'checked_until', the exact check stopped
+    there; continue with received_before=checked_until and the same other criteria.
     subject / sender / recipient: substring of the subject, sender name or address, To/CC names.
     received_after / received_before: local dates 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM' (before is inclusive of that day).
     folder: a folder path, or 'all' to search every mail folder of the main mailbox.

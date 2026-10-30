@@ -107,6 +107,7 @@ claude mcp add outlook-local --scope user -- C:\path\to\outlook-local-mcp\.venv\
   - `index`：走 Windows 搜索索引，速度快，但很多中文词不在索引里，会漏检。
   - `exact`：两段式检索。第一段用日期、发件人、主题、文件夹等其他条件，通过 Table 快速筛出候选邮件；第二段从新到旧逐封核对原文是否包含检索词。主题已经命中的直接算，主题没命中的才读正文，每封约 40ms。凑够 `limit` 条就停，单次最多 90 秒、最多扫描 `max_scan` 封（默认 1500）。没扫完时会说明检查到了哪个日期，更早的部分用索引结果补上。
   - `auto`（默认）：检索词含中日韩文字时用 `exact`，否则用 `index`。
+  - **时间上限**：每次检索最多约 40 秒（`OUTLOOK_MCP_TIME_BUDGET` 可调）。从 claude.ai 网页或手机通过 Claude Desktop 远程调用时，超过 60 秒会直接超时，所以这里留了余量。没查完时，结果里会带 `checked_until`；用同样的条件加上 `received_before=checked_until` 再调一次，就能接着往更早的邮件查。
   - 实测：对一个约 1100 封的文件夹精确检索中文词组，全部扫完约 76 秒（直接用 DASL `LIKE` 要 256 秒）；加上 60 天的日期范围后，在全邮箱里检索只要约 8 秒。**加上日期范围或发件人，速度能快一个数量级。**
 - **短 id**：每封邮件用 `m1k3` 这样的短编号代替 140 个字符的 EntryID。编号和 EntryID 的对应表存在 `%LOCALAPPDATA%\outlook-local-mcp\ids.sqlite3`，里面只有编号，没有邮件内容。Claude Desktop 会给每个对话和 Cowork 会话各启动一个服务进程，它们共用这张表，所以编号可以跨对话使用，重启后也有效。
 - **紧凑输出**：返回不带缩进的紧凑 JSON，值为 false 或默认值的字段直接省略，正文里多余的空行会被压缩。
@@ -119,6 +120,7 @@ claude mcp add outlook-local --scope user -- C:\path\to\outlook-local-mcp\.venv\
 | `OUTLOOK_MCP_ATTACHMENT_DIR` | 附件的默认保存目录 |
 | `OUTLOOK_MCP_AUDIT_LOG` | 审计日志的路径 |
 | `OUTLOOK_MCP_ID_DB` | 短 id 对应表的路径 |
+| `OUTLOOK_MCP_TIME_BUDGET` | 每次检索的时间上限（秒），默认 40 |
 
 ## 本地数据
 
