@@ -12,13 +12,16 @@ SAFETY MODEL
    Display, ExecuteMso, SendAndReceive, ...) are never referenced;
    tests/test_safety.py parses the source and fails if one appears, or if
    an attribute is looked up dynamically (getattr with a non-literal name).
-2. The only call to ``.Move(`` is in ``_guarded_move``. It refuses any
-   target that is, or sits under, Deleted Items, Junk Email, Outbox, Sync
-   Issues or Recoverable Items, and any folder that does not hold mail.
-   Moved mail therefore always stays in a normal, visible folder.
+2. ``.Move(`` appears twice. ``_guarded_move`` refuses any target that is,
+   or sits under, Deleted Items, Junk Email, Outbox, Sync Issues or
+   Recoverable Items, and any folder that does not hold mail, so moved mail
+   always stays in a normal, visible folder. ``_discard_draft_move`` moves
+   only unsent drafts from Drafts into Deleted Items, where they can be
+   restored; received and sent mail can never go there.
 3. Drafts are created with ``.Save()`` only. ``Reply()``, ``ReplyAll()`` and
-   ``Forward()`` merely return a new unsent item. ``update_draft`` refuses
-   anything that is not an unsent message inside a Drafts folder.
+   ``Forward()`` merely return a new unsent item. Every draft edit or
+   discard goes through ``_get_draft``, which refuses anything that is not
+   an unsent message inside a Drafts folder.
 4. Every write is appended to a local JSONL audit log that records the
    source folder of each move, so any move can be reversed.
 """
@@ -35,7 +38,7 @@ from typing import Any
 
 import win32com.client
 
-from . import destinations, ids
+from . import destinations, draft_html, ids
 
 # Outlook constants, hardcoded so we don't depend on the makepy cache.
 OL_FOLDER_DELETED = 3
@@ -1179,6 +1182,20 @@ def create_forward_draft(
     return _draft_result(fwd, "create_forward_draft", forwarding=original.Subject)
 
 
+def _get_draft(ns, item_id: str):
+    """The item, if it is an unsent message in its store's Drafts folder; refuse anything else."""
+    mail = _get_item(ns, item_id)
+    if mail.Class != OL_CLASS_MAIL or mail.Sent:
+        raise OutlookError("Refused: this item is not an unsent draft.")
+    try:
+        drafts = mail.Parent.Store.GetDefaultFolder(OL_FOLDER_DRAFTS)
+    except Exception:  # noqa: BLE001
+        drafts = ns.GetDefaultFolder(OL_FOLDER_DRAFTS)
+    if not _same(ns, mail.Parent, drafts):
+        raise OutlookError("Refused: only items in the Drafts folder can be edited or discarded.")
+    return mail
+
+
 def update_draft(
     item_id: str,
     to: list[str] | None = None,
@@ -1191,16 +1208,7 @@ def update_draft(
     add_attachments: list[str] | None = None,
 ) -> dict[str, Any]:
     ns = _ns()
-    mail = _get_item(ns, item_id)
-    if mail.Class != OL_CLASS_MAIL or mail.Sent:
-        raise OutlookError("Refused: this item is not an unsent draft.")
-    try:
-        drafts = mail.Parent.Store.GetDefaultFolder(OL_FOLDER_DRAFTS)
-    except Exception:  # noqa: BLE001
-        drafts = ns.GetDefaultFolder(OL_FOLDER_DRAFTS)
-    if not _same(ns, mail.Parent, drafts):
-        raise OutlookError("Refused: only items in the Drafts folder can be edited.")
-
+    mail = _get_draft(ns, item_id)
     _apply_headers(mail, to, cc, bcc, subject)
     note = None
     if body is not None:
@@ -1229,3 +1237,81 @@ def update_draft(
     mail.Save()
     extra = {"note": note} if note else {}
     return _draft_result(mail, "update_draft", **extra)
+
+
+def _edit_html_body(mail, edit) -> int:
+    """Run an edit on the draft's HTML body (plain-text drafts are converted to HTML first)."""
+    if mail.BodyFormat != OL_FORMAT_HTML:
+        mail.HTMLBody = f"<html><body><div>{_text_to_html(mail.Body or '')}</div></body></html>"
+    try:
+        new_html, count = edit(mail.HTMLBody or "")
+    except draft_html.EditError as exc:
+        raise OutlookError(str(exc)) from exc
+    mail.HTMLBody = new_html
+    mail.Save()
+    return count
+
+
+def edit_draft_text(
+    item_id: str,
+    find: str,
+    replace_with: str = "",
+    occurrence: str | int = "all",
+    match_case: bool = False,
+    whole_body: bool = False,
+) -> dict[str, Any]:
+    ns = _ns()
+    mail = _get_draft(ns, item_id)
+    count = _edit_html_body(mail, lambda h: draft_html.replace_text(
+        h, find, replace_with, occurrence, match_case, _MARKER_START, _MARKER_END, whole_body))
+    return _draft_result(mail, "edit_draft_text", changed=count,
+                         text_now=_truncate(_tidy_body(mail.Body or ""), 1500))
+
+
+def format_draft_text(
+    item_id: str,
+    find: str,
+    occurrence: str | int = "all",
+    match_case: bool = False,
+    whole_body: bool = False,
+    **style: Any,
+) -> dict[str, Any]:
+    ns = _ns()
+    mail = _get_draft(ns, item_id)
+    count = _edit_html_body(mail, lambda h: draft_html.format_text(
+        h, find, occurrence, match_case, marker_start=_MARKER_START, marker_end=_MARKER_END,
+        whole_body=whole_body, **style))
+    return _draft_result(mail, "format_draft_text", formatted=count)
+
+
+def _discard_draft_move(ns, mail):
+    """The one move into Deleted Items this package makes: only for unsent drafts, which
+    _get_draft has already checked. Deleted Items keeps them restorable."""
+    return mail.Move(mail.Parent.Store.GetDefaultFolder(OL_FOLDER_DELETED))
+
+
+def discard_drafts(item_ids: list[str]) -> dict[str, Any]:
+    if not item_ids:
+        raise OutlookError("No item ids given.")
+    if len(item_ids) > MAX_BATCH:
+        raise OutlookError(f"At most {MAX_BATCH} items per call.")
+    ns = _ns()
+    discarded, failed = [], []
+    for item_id in item_ids:
+        try:
+            mail = _get_draft(ns, item_id)
+            subject, old_entry = mail.Subject, mail.EntryID
+            new_entry = _discard_draft_move(ns, mail).EntryID
+            handle = ids.rebind(item_id if ids.HANDLE_RE.match(item_id.strip()) else old_entry, new_entry)
+            discarded.append({"id": handle, "subject": subject})
+            _audit("discard_draft", subject=subject, from_folder="Drafts", to_folder="Deleted Items",
+                   old_id=old_entry, new_id=new_entry)
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"id": item_id, "error": str(exc)})
+    result: dict[str, Any] = {
+        "discarded": discarded,
+        "note": "Moved to Deleted Items, not permanently deleted. To restore: move_emails(ids, 'Drafts').",
+    }
+    if failed:
+        result["failed"] = failed
+    return result

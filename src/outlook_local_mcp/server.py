@@ -26,7 +26,7 @@ def _call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> str:
 
 INSTRUCTIONS = """\
 Local access to the user's classic desktop Outlook mailbox (Exchange, cached mode) via COM.
-Outlook must be running. Nothing here can send mail or delete anything.
+Outlook must be running. Nothing here can send mail or permanently delete anything.
 
 IDS
 - Emails are identified by short ids like 'm1k3' from list/search/thread results. Pass them as
@@ -62,7 +62,13 @@ ORGANISING
 DRAFTS
 - create_draft / create_reply_draft / create_forward_draft save to Drafts and are NOT sent; tell the user
   the draft is waiting for them in Outlook. Reply drafts keep the quoted thread; write only the new text.
-- update_draft edits only unsent drafts; by default it replaces only the text written by these tools.
+- update_draft changes recipients/subject/attachments, or rewrites the body text written by these tools.
+- edit_draft_text finds visible text and replaces it; replace_with='' deletes it. Copy the text from get_email.
+- format_draft_text makes text bold/italic/underlined/struck through, coloured, highlighted, or changes size/font.
+- Both only touch the text these tools wrote unless whole_body=true (needed for drafts the user wrote, and
+  for the quoted thread of a reply; don't alter quoted mail unless the user asks).
+- discard_drafts moves unsent drafts to Deleted Items (restorable with move_emails(ids, 'Drafts')).
+  Only drafts can be discarded; confirm with the user first unless they asked for it.
 - The user's Outlook signature is not added automatically.
 
 SAFETY
@@ -300,6 +306,60 @@ def update_draft(
         oc.update_draft, item_id, to=to, cc=cc, bcc=bcc, subject=subject, body=body,
         body_format=body_format, replace_entire_body=replace_entire_body, add_attachments=add_attachments,
     )
+
+
+@mcp.tool(annotations=WRITE)
+def edit_draft_text(
+    item_id: str,
+    find: str,
+    replace_with: str = "",
+    occurrence: str = "all",
+    match_case: bool = False,
+    whole_body: bool = False,
+) -> str:
+    """Replace or delete text in an unsent draft, keeping its formatting. replace_with='' deletes.
+
+    find: the text as it reads (copy it from get_email); tags, line breaks and extra spaces in the draft are ignored.
+    occurrence: 'all', 'first', 'last' or '1', '2', ... (nth match).
+    whole_body: false = only the text these tools wrote; true = the whole draft, incl. a reply's quoted thread.
+    Returns the draft's text afterwards so you can check the result.
+    """
+    return _call(oc.edit_draft_text, item_id, find, replace_with, occurrence=occurrence,
+                 match_case=match_case, whole_body=whole_body)
+
+
+@mcp.tool(annotations=WRITE)
+def format_draft_text(
+    item_id: str,
+    find: str,
+    bold: bool | None = None,
+    italic: bool | None = None,
+    underline: bool | None = None,
+    strikethrough: bool | None = None,
+    color: str | None = None,
+    highlight: str | None = None,
+    font_size: float | None = None,
+    font_name: str | None = None,
+    occurrence: str = "all",
+    match_case: bool = False,
+    whole_body: bool = False,
+) -> str:
+    """Format text in an unsent draft. Set only what should change; false removes bold/italic/underline.
+
+    color / highlight: a colour name ('red', 'yellow') or '#RRGGBB'. font_size in points.
+    find, occurrence, whole_body: as in edit_draft_text.
+    """
+    return _call(oc.format_draft_text, item_id, find, occurrence=occurrence, match_case=match_case,
+                 whole_body=whole_body, bold=bold, italic=italic, underline=underline,
+                 strikethrough=strikethrough, color=color, highlight=highlight,
+                 font_size=font_size, font_name=font_name)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False))
+def discard_drafts(item_ids: list[str]) -> str:
+    """Discard unsent drafts by moving them to Deleted Items (not permanent; restore with
+    move_emails(ids, 'Drafts')). Refuses anything that is not an unsent draft in Drafts."""
+    return _call(oc.discard_drafts, item_ids)
 
 
 @mcp.tool(annotations=READ)

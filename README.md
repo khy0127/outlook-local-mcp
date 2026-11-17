@@ -17,15 +17,17 @@ A fully local [MCP](https://modelcontextprotocol.io) server for **classic deskto
 | 能做 | 做不到 |
 |---|---|
 | 读取、检索邮件和日历 | **发送**任何邮件（代码里没有 `.Send`） |
-| 移动邮件、归档到 Archive | **删除**任何东西（没有 `.Delete` / `PermanentlyDelete`，也删不了文件夹） |
+| 移动邮件、归档到 Archive | **永久删除**任何东西（没有 `.Delete` / `PermanentlyDelete`，也删不了文件夹） |
 | 新建文件夹 | 移入 Deleted Items / Junk Email / Outbox / Sync Issues（运行时拒绝，包括它们的子文件夹） |
 | 标记已读/未读、旗标、分类 | 修改已收到或已发送邮件的正文 |
 | 新建草稿、回复/转发草稿、修改草稿 | 打开 Outlook 窗口或执行功能区命令 |
+| 草稿里删改文字、加格式（加粗、颜色、高亮等） | 把收到或发出的邮件移进 Deleted Items |
+| 丢弃草稿：移到 Deleted Items，可以移回来 | |
 | 把附件另存到本地 | |
 
 这些边界有三层保证：
 
-1. **代码层**：`tests/test_safety.py` 会解析源码。只要出现 `Send`、`Delete`、`PermanentlyDelete`、`MoveTo`、`Display`、`ExecuteMso` 这类成员，或者用 `getattr` 动态拼方法名，测试就会失败。整个包里 `.Move` 只能出现一次，而且必须在 `_guarded_move` 里面。
+1. **代码层**：`tests/test_safety.py` 会解析源码。只要出现 `Send`、`Delete`、`PermanentlyDelete`、`MoveTo`、`Display`、`ExecuteMso` 这类成员，或者用 `getattr` 动态拼方法名，测试就会失败。整个包里 `.Move` 只能出现两次：一次在 `_guarded_move` 里；另一次在 `_discard_draft_move` 里，只用来把未发送的草稿移进 Deleted Items。
 2. **运行时**：`_guarded_move` 会逐级检查目标文件夹及其所有上级文件夹，同时按 EntryID 和名称比对，凡是 Deleted Items、Junk、Outbox、Sync Issues、Recoverable Items 一律拒绝。`update_draft` 只修改 Drafts 文件夹里尚未发送的邮件。
 3. **可追溯**：每次写操作都会追加到 `%LOCALAPPDATA%\outlook-local-mcp\audit.jsonl`。移动会记下原文件夹，可以用 `list_recent_actions` 查到后再移回去。
 
@@ -80,7 +82,15 @@ claude mcp add outlook-local --scope user -- C:\path\to\outlook-local-mcp\.venv\
 - **读取**：`list_folders`、`list_emails`、`search_emails`、`get_email`、`get_thread`、`list_calendar_events`、`list_recent_actions`
 - **整理**：`move_emails`、`archive_emails`、`create_folder`、`set_email_status`
 - **附件**：`save_attachments`、`list_save_destinations`
-- **草稿**：`create_draft`、`create_reply_draft`、`create_forward_draft`、`update_draft`
+- **草稿**：`create_draft`、`create_reply_draft`、`create_forward_draft`、`update_draft`、`edit_draft_text`、`format_draft_text`、`discard_drafts`
+
+### 编辑草稿
+
+- `edit_draft_text`：按草稿里能看到的文字查找，把它替换掉；`replace_with` 留空就是删除。查找时会忽略 HTML 标签、换行和多余空格，所以从 `get_email` 里直接复制的文字就能对上。可以用 `occurrence` 只改第几处。
+- `format_draft_text`：设置加粗、斜体、下划线、删除线、文字颜色、高亮、字号、字体；传 `false` 则去掉加粗等效果。
+- 这两个工具默认只改本工具写进草稿的那段文字，不碰回复草稿里引用的原邮件。如果草稿是你自己在 Outlook 里写的，或者确实要改引用部分，加上 `whole_body=true`。
+- 实现方式是直接改草稿的 HTML，不打开草稿窗口，也不占用你的屏幕。没有用 Outlook 内置的 Word 编辑器，因为它只有在草稿窗口打开时才会把修改写回草稿。
+- `discard_drafts`：只能丢弃 Drafts 文件夹里尚未发送的草稿，丢弃后移到 Deleted Items，并记入审计日志；需要时用 `move_emails(ids, "Drafts")` 就能找回来。注意：Deleted Items 可能会按 Outlook 或公司的保留策略被自动清空。
 
 文件夹路径的写法：`Inbox`、`Inbox/Project Alpha`、`Archive`、`Drafts`、`Sent`；其他存储（比如 Online Archive）写成 `//Online Archive - you@example.com/Archive`。`search_emails` 用 `folder="all"` 时会搜索主邮箱的全部邮件文件夹。
 

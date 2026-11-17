@@ -23,7 +23,8 @@ FORBIDDEN = {
 }
 # Allowed, but only inside these functions.
 RESTRICTED = {
-    "Move": {"_guarded_move"},
+    # _discard_draft_move: unsent drafts only, into Deleted Items (restorable).
+    "Move": {"_guarded_move", "_discard_draft_move"},
     "Reply": {"create_reply_draft"},
     "ReplyAll": {"create_reply_draft"},
     "Forward": {"create_forward_draft"},
@@ -76,14 +77,14 @@ def main() -> int:
         1 for f in files for n in ast.walk(ast.parse(f.read_text(encoding="utf-8")))
         if isinstance(n, ast.Attribute) and n.attr == "Move"
     )
-    if moves != 1:
-        problems.append(f"expected exactly one '.Move' reference, found {moves}")
+    if moves != 2:
+        problems.append(f"expected exactly two '.Move' references (guarded move, draft discard), found {moves}")
     if problems:
         print("SAFETY AUDIT FAILED:")
         for p in problems:
             print("  " + p)
         return 1
-    print(f"Safety audit passed ({len(files)} files): no send/delete members, one guarded Move.")
+    print(f"Safety audit passed ({len(files)} files): no send/delete members, Move only in the two guarded functions.")
     return 0
 
 
